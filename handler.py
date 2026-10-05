@@ -158,43 +158,39 @@ def query_task(task_id: str) -> dict:
 # ============================================================
 
 def wait_for_task(task_id: str) -> dict:
-    started = time.time()
+    started = time.monotonic()
+    last_status = None
 
     while True:
-
-        if time.time() - started > GENERATION_TIMEOUT:
+        if time.monotonic() - started > GENERATION_TIMEOUT:
             raise TimeoutError(
-                "ACE_STEP_GENERATION_TIMEOUT"
+                f"ACE_STEP_GENERATION_TIMEOUT: task_id={task_id}; status={last_status}"
             )
 
         result = query_task(task_id)
+        status = clean(result.get("status")).lower()
+        if status != last_status:
+            print(f"[DJB] ACE-Step task {task_id}: status={status}", flush=True)
+            last_status = status
 
-        status = clean(
-            result.get("status")
-        ).lower()
-
-        if status in {
-            "success",
-            "succeeded",
-            "completed",
-            "complete",
-            "finished"
-        }:
+        if status in {"1", "success", "succeeded", "completed", "complete", "finished"}:
             return result
 
-        if status in {
-            "failed",
-            "error",
-            "cancelled",
-            "canceled"
-        }:
+        if status in {"2", "failed", "error", "cancelled", "canceled"}:
+            details = result.get("error") or result.get("message")
+            if not details:
+                raw = result.get("result")
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except ValueError:
+                        raw = None
+                if isinstance(raw, list):
+                    raw = raw[0] if raw else None
+                if isinstance(raw, dict):
+                    details = raw.get("error") or raw.get("message")
             raise RuntimeError(
-                "ACE_STEP_GENERATION_FAILED: "
-                + clean(
-                    result.get("error")
-                    or result.get("message")
-                    or status
-                )
+                "ACE_STEP_GENERATION_FAILED: " + clean(details or status)
             )
 
         time.sleep(POLL_INTERVAL)
@@ -205,67 +201,55 @@ def wait_for_task(task_id: str) -> dict:
 # ============================================================
 
 def extract_audio_items(result: dict) -> list[dict]:
-    candidates = []
-
-    for key in (
-        "result",
-        "results",
-        "output",
-        "outputs",
-        "data",
-        "audio",
-        "audios"
-    ):
-        value = result.get(key)
-
-        if isinstance(value, list):
-            candidates.extend(value)
-
-        elif isinstance(value, dict):
-            candidates.append(value)
-
-    if not candidates:
-        candidates.append(result)
-
     audio_items = []
+    seen = set()
 
-    for item in candidates:
+    def collect(value, depth=0):
+        if depth > 8:
+            return
+        if isinstance(value, str):
+            value = value.strip()
+            if value.startswith(("[", "{")):
+                try:
+                    collect(json.loads(value), depth + 1)
+                except ValueError as exc:
+                    raise RuntimeError("ACE_STEP_INVALID_RESULT_JSON") from exc
+            elif value.startswith(("http://", "https://", "/")):
+                collect({"url": value}, depth + 1)
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect(item, depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
 
-        if isinstance(item, str):
-            url = clean(item)
-
-            if url:
-                audio_items.append(
-                    {
-                        "url": url
-                    }
-                )
-
-            continue
-
-        if not isinstance(item, dict):
-            continue
+        status = clean(value.get("status")).lower()
+        if status in {"2", "failed", "error", "cancelled", "canceled"}:
+            raise RuntimeError("ACE_STEP_AUDIO_FAILED: " + clean(
+                value.get("error") or value.get("message") or status
+            ))
 
         url = clean(
-            item.get("audio_url")
-            or item.get("audioUrl")
-            or item.get("url")
-            or item.get("file_url")
-            or item.get("fileUrl")
-            or item.get("path")
+            value.get("file") or value.get("audio_url") or value.get("audioUrl")
+            or value.get("url") or value.get("file_url") or value.get("fileUrl")
+            or value.get("path")
         )
-
-        if not url:
-            continue
-
-        audio_items.append(
-            {
+        if url and url not in seen:
+            seen.add(url)
+            metas = value.get("metas")
+            if not isinstance(metas, dict):
+                metas = {}
+            audio_items.append({
                 "url": url,
-                "seed": item.get("seed"),
-                "duration": item.get("duration")
-            }
-        )
+                "seed": value.get("seed", value.get("seed_value")),
+                "duration": value.get("duration", metas.get("duration"))
+            })
+        for key in ("result", "results", "output", "outputs", "data", "audio", "audios"):
+            if key in value:
+                collect(value[key], depth + 1)
 
+    collect(result)
     return audio_items
 
 
@@ -274,11 +258,9 @@ def extract_audio_items(result: dict) -> list[dict]:
 # ============================================================
 
 def download_audio(audio_url: str) -> bytes:
-    if audio_url.startswith("/"):
-        audio_url = urljoin(
-            ACESTEP_API_URL + "/",
-            audio_url.lstrip("/")
-        )
+    audio_url = urljoin(ACESTEP_API_URL + "/", audio_url)
+    if not audio_url.startswith(("http://", "https://")):
+        raise RuntimeError("ACE_STEP_INVALID_AUDIO_URL")
 
     response = requests.get(
         audio_url,
@@ -326,7 +308,7 @@ def upload_audio(
                 f"Bearer {DJB_UPLOAD_TOKEN}"
         },
         files={
-            "file": (
+            "audio": (
                 filename,
                 audio_data,
                 "audio/mpeg"
@@ -338,44 +320,38 @@ def upload_audio(
         timeout=UPLOAD_TIMEOUT
     )
 
-    response.raise_for_status()
-
     try:
         data = response.json()
     except ValueError as exc:
         raise RuntimeError(
-            "DJB_UPLOAD_INVALID_JSON"
+            f"DJB_UPLOAD_INVALID_JSON: HTTP {response.status_code}"
         ) from exc
 
-    if not data.get("success"):
+    if not isinstance(data, dict):
+        raise RuntimeError("DJB_UPLOAD_INVALID_RESPONSE")
+
+    if not response.ok or not data.get("success"):
         raise RuntimeError(
-            "DJB_UPLOAD_FAILED: "
-            + clean(
-                data.get("message")
-                or data.get("error")
-            )
+            f"DJB_UPLOAD_FAILED: HTTP {response.status_code}; "
+            + clean(data.get("message") or data.get("error") or "UNKNOWN_ERROR")
         )
+
+    upload_data = data.get("data")
+    if not isinstance(upload_data, dict):
+        upload_data = {}
 
     public_url = clean(
-        data.get("url")
-        or data.get("audio_url")
-        or (
-            data.get("data", {}).get("url")
-            if isinstance(data.get("data"), dict)
-            else ""
-        )
+        upload_data.get("audio_url") or upload_data.get("url")
+        or data.get("audio_url") or data.get("url")
     )
-
     if not public_url:
-        raise RuntimeError(
-            "DJB_UPLOAD_URL_MISSING_IN_RESPONSE"
-        )
+        raise RuntimeError("DJB_UPLOAD_URL_MISSING_IN_RESPONSE")
 
     return {
         "url": public_url,
         "filename": clean(
-            data.get("filename")
-            or filename
+            upload_data.get("file_name") or upload_data.get("filename")
+            or data.get("filename") or filename
         )
     }
 
@@ -393,9 +369,9 @@ def publish_results(
         ace_result
     )
 
-    if not audio_items:
+    if len(audio_items) < max_variants:
         raise RuntimeError(
-            "ACE_STEP_NO_AUDIO_RESULTS"
+            f"ACE_STEP_AUDIO_COUNT_MISMATCH: expected={max_variants}; received={len(audio_items)}"
         )
 
     published = []
@@ -594,6 +570,11 @@ def handler(job):
             raise ValueError(
                 "INVALID_INPUT"
             )
+
+        if not DJB_UPLOAD_TOKEN:
+            raise RuntimeError("DJB_UPLOAD_TOKEN_MISSING")
+        if not DJB_UPLOAD_URL:
+            raise RuntimeError("DJB_UPLOAD_URL_MISSING")
 
         lyrics = clean(
             data.get("lyrics")
